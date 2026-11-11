@@ -4343,38 +4343,45 @@ _SSHX_SESSIONS_LOCK = threading.RLock()
 
 
 def start_sshx_session(host: str, port: int, password: str, vps_id: int) -> Optional[str]:
-    """Install SSHX in a VPS if needed, start its root terminal, and return its URL."""
+    """Connect to a VPS, install/run the official SSHX client, and return its URL."""
     if paramiko is None:
-        logger.warning("SSHX could not start for VPS #%s: paramiko is unavailable", vps_id)
+        logger.error("SSHX VPS #%s failed: Paramiko is not installed", vps_id)
         return None
+
     client = None
     channel = None
+    output = ""
+    stage = "SSH connection"
     try:
+        if not host or not str(host).strip():
+            raise RuntimeError("Node SSH host is empty; check the node URL / YOUR_SERVER_IP")
+        if not (1 <= int(port) <= 65535):
+            raise RuntimeError("SSH forwarded port is invalid")
+
         client = get_ssh_client()
         client.connect(
-            hostname=str(host), port=int(port), username="root", password=str(password),
-            timeout=20, banner_timeout=20, auth_timeout=20,
+            hostname=str(host).strip().strip("[]"), port=int(port), username="root",
+            password=str(password), timeout=25, banner_timeout=25, auth_timeout=25,
             allow_agent=False, look_for_keys=False,
         )
-        command = (
-            "set -e; "
-            "if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh; fi; "
-            'export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; '
-            "command -v sshx >/dev/null 2>&1 || { echo 'SSHX binary was not found after installation'; exit 127; }; "
-            "exec sshx"
-        )
-        _stdin, stdout, _stderr = client.exec_command(command, get_pty=True, timeout=30)
+
+        # Install the official client; if its install location is not on PATH,
+        # use SSHX's documented run mode as a fallback.
+        stage = "SSHX installation / startup"
+        command = 'set +e\nexport PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"\nif ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then\n  echo "SSHX_ERROR: curl or wget is required to install SSHX"\n  exit 127\nfi\nif ! command -v sshx >/dev/null 2>&1; then\n  echo "SSHX_INSTALL: installing official SSHX client"\n  if command -v curl >/dev/null 2>&1; then\n    curl -sSf https://sshx.io/get | sh\n  else\n    wget -qO- https://sshx.io/get | sh\n  fi\nfi\nexport PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"\nSSHX_BIN="$(command -v sshx 2>/dev/null)"\nif [ -n "$SSHX_BIN" ]; then\n  echo "SSHX_START: launching installed client"\n  exec "$SSHX_BIN"\nfi\necho "SSHX_FALLBACK: installed binary not on PATH; using official run mode"\nif command -v curl >/dev/null 2>&1; then\n  exec sh -c \'curl -sSf https://sshx.io/get | sh -s run\'\nelse\n  exec sh -c \'wget -qO- https://sshx.io/get | sh -s run\'\nfi'
+        _stdin, stdout, _stderr = client.exec_command(command, get_pty=True, timeout=45)
         channel = stdout.channel
-        channel.settimeout(0.5)
-        output = ""
-        deadline = time.monotonic() + 75
-        link_pattern = re.compile(r"https://sshx\.io/s/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+")
+        channel.settimeout(1.0)
+
+        link_pattern = re.compile(r"https://sshx\.io/s/[A-Za-z0-9._~%+/-]+(?:#[A-Za-z0-9._~%+/-]+)?")
+        deadline = time.monotonic() + 150
         while time.monotonic() < deadline:
             if channel.recv_ready():
-                output += channel.recv(4096).decode("utf-8", errors="replace")
-                match = link_pattern.search(output)
+                output += channel.recv(8192).decode("utf-8", errors="replace")
+                clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+                match = link_pattern.search(clean)
                 if match:
-                    link = match.group(0).rstrip(".,)")
+                    link = match.group(0).rstrip(".,);]\"'")
                     with _SSHX_SESSIONS_LOCK:
                         old = _SSHX_SESSIONS.pop(int(vps_id), None)
                         if old:
@@ -4384,16 +4391,21 @@ def start_sshx_session(host: str, port: int, password: str, vps_id: int) -> Opti
                                 except Exception:
                                     pass
                         _SSHX_SESSIONS[int(vps_id)] = (client, channel)
-                    logger.info("SSHX terminal started for VPS #%s", vps_id)
+                    logger.info("SSHX session created for VPS #%s", vps_id)
                     return link
             if channel.exit_status_ready():
                 break
-            time.sleep(0.1)
-        exit_status = channel.recv_exit_status() if channel.exit_status_ready() else "still running"
-        logger.warning("SSHX did not return a link for VPS #%s (exit=%s): %s",
-                       vps_id, exit_status, scrub_secrets(output[-1200:]))
+            time.sleep(0.15)
+
+        exit_status = channel.recv_exit_status() if channel.exit_status_ready() else "still running (no URL received)"
+        safe_output = scrub_secrets(output[-2500:])
+        # Never write a live SSHX bearer URL to logs, even on a parser failure.
+        safe_output = re.sub(r"https://sshx\.io/s/[^\s<>\"']+", "[SSHX_LINK_REDACTED]", safe_output)
+        logger.error("SSHX VPS #%s failed during %s (exit=%s). Output: %s",
+                     vps_id, stage, exit_status, safe_output or "<no output>")
     except Exception as exc:
-        logger.warning("Could not start SSHX for VPS #%s: %s", vps_id, scrub_secrets(exc))
+        logger.error("SSHX VPS #%s failed during %s: %s", vps_id, stage, scrub_secrets(exc))
+
     for item in (channel, client):
         if item:
             try:
@@ -7826,14 +7838,24 @@ class ManageView(PanelView):
             return
 
         node = await run_blocking(get_node, vps["node_id"])
-        ssh_host = ((node.get("url") or "").replace("http://", "").replace("https://", "").split(":")[0]
-                    if node else "") or YOUR_SERVER_IP
+        node_url = str((node or {}).get("url") or "").strip()
+        if node_url:
+            parsed_node_url = urlparse(node_url if "://" in node_url else "//" + node_url)
+            ssh_host = parsed_node_url.hostname or node_url.split("/")[0].split(":")[0]
+        else:
+            ssh_host = YOUR_SERVER_IP
+        if not ssh_host:
+            await interaction.followup.send(
+                embed=error_embed("Node Address Missing", "Set the node URL or YOUR_SERVER_IP to the reachable node address."),
+                ephemeral=True,
+            )
+            return
         link = await asyncio.to_thread(
             start_sshx_session, ssh_host, int(forward["host_port"]), str(password), int(vps["id"])
         )
         if not link:
             await interaction.followup.send(
-                embed=error_embed("SSHX Could Not Start", "SSHX could not create a session. Check VPS SSH access and network connectivity."),
+                embed=error_embed("SSHX Could Not Start", "The bot could not finish the SSHX startup. Check the bot console for the exact SSHX stage/error (SSH connection, installer, or network). The private session link is never written to logs."),
                 ephemeral=True,
             )
             return
