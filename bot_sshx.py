@@ -211,7 +211,7 @@ PUBLIC_VPS_COOLDOWN_HOURS: int = _env_int("PUBLIC_VPS_COOLDOWN_HOURS", 24)
 PUBLIC_VPS_REQUIRE_ACCOUNT_AGE: int = _env_int("PUBLIC_VPS_REQUIRE_ACCOUNT_AGE", 3)
 
 # ── Web SSH terminal ─────────────────────────────────────────────────────────
-WEBSSH_ENABLED: bool = _env_bool("WEBSSH_ENABLED", True) and (Flask is not None and paramiko is not None)
+WEBSSH_ENABLED: bool = False  # Replaced by SSHX; legacy WebSSH server is disabled
 WEBSSH_HOST: str = str(_env("WEBSSH_HOST", "0.0.0.0"))
 WEBSSH_PORT: int = _env_int("WEBSSH_PORT", 5000)
 WEBSSH_SERVER_IP: str = str(_env("WEBSSH_SERVER_IP", YOUR_SERVER_IP))
@@ -7664,8 +7664,8 @@ class ManageView(PanelView):
                         callback=self._console, row=(rows or 0) + 1)
         self.add_button(label="Password", style=discord.ButtonStyle.secondary, emoji="🔑",
                         callback=self._password, row=(rows or 0) + 1)
-        self.add_button(label="Web SSH", style=discord.ButtonStyle.secondary, emoji="🌐",
-                        callback=self._webssh, row=(rows or 0) + 1)
+        self.add_button(label="SSHX", style=discord.ButtonStyle.secondary, emoji="🌐",
+                        callback=self._sshx, row=(rows or 0) + 1)
         self.add_button(label="Ports", style=discord.ButtonStyle.secondary, emoji="🔌",
                         callback=self._ports, row=(rows or 0) + 2)
         self.add_button(label="Share", style=discord.ButtonStyle.secondary, emoji="👥",
@@ -7785,52 +7785,64 @@ class ManageView(PanelView):
                   "• Admins cannot read DMs sent to you", False)
         await interaction.response.send_message(embed=embed, view=PasswordView(self), ephemeral=True)
 
-    # ── web ssh ──────────────────────────────────────────────────────────────
-    async def _webssh(self, interaction: discord.Interaction) -> None:
+    # ── SSHX browser terminal ────────────────────────────────────────────────
+    async def _sshx(self, interaction: discord.Interaction) -> None:
         vps = self.vps
-        if not WEBSSH_ENABLED:
+
+        # SSHX links provide direct shell access: only the VPS owner may request one.
+        if str(interaction.user.id) != str(vps.get("user_id")):
             await interaction.response.send_message(
-                embed=warning_embed("Web Terminal Disabled",
-                                    "The browser terminal is switched off on this host. Use the SSH command instead."),
-                ephemeral=True)
+                embed=error_embed("Owner Only", "Only the owner of this VPS can generate its SSHX terminal link."),
+                ephemeral=True,
+            )
             return
+
+        if str(vps.get("status", "")).lower() != "running" or bool(vps.get("suspended")):
+            await interaction.response.send_message(
+                embed=warning_embed("VPS Not Running", "Start your VPS first. SSHX is available while the VPS is running."),
+                ephemeral=True,
+            )
+            return
+
         await safe_defer(interaction, ephemeral=True)
         forward = next((f for f in await run_blocking(get_forwards_for_container, vps["container_name"])
                         if int(f["vps_port"]) == 22), None)
         if forward is None:
-            if str(vps.get("status")) != "running":
-                await interaction.followup.send(
-                    embed=warning_embed("Server Stopped", "Start the VPS first — SSH is only reachable while it runs."),
-                    ephemeral=True)
-                return
             host_port = await create_port_forward(vps["user_id"], vps["container_name"], 22, vps["node_id"])
             if not host_port:
                 await interaction.followup.send(
-                    embed=error_embed("Port Forward Failed", "Could not allocate an SSH port. Try again or contact an admin."),
-                    ephemeral=True)
+                    embed=error_embed("SSH Port Setup Failed", "Could not create the VPS SSH port forward."),
+                    ephemeral=True,
+                )
                 return
             forward = {"host_port": host_port, "vps_port": 22}
 
-        token = issue_webssh_token(interaction.user.id, vps=vps, ttl_seconds=1800,
-                                   label=vps["container_name"])
-        link = _public_url_for_token(token)
-        ssh_command = ssh_command_for(int(forward["host_port"]))
+        password = decrypt_secret(vps.get("root_password"))
+        if not password:
+            await interaction.followup.send(
+                embed=error_embed("Password Unavailable", "Regenerate the VPS root password, then try again."),
+                ephemeral=True,
+            )
+            return
 
-        embed = create_embed("Web Terminal Ready",
-                             f"One-click browser SSH for `{vps['container_name']}`.\n"
-                             f"Link expires in **30 minutes**.", COLORS["network"])
-        add_field(embed, "🌐 Open terminal", f"[Click here to open Web SSH]({link})", False)
-        add_field(embed, "🔐 Or use your SSH client", f"```bash\n{escape_backticks(ssh_command)}\n```", False)
-        add_field(embed, "🔒 Optional lock",
-                  "Press **Add a PIN** below to require a 4-8 digit code in addition to the link. "
-                  "Recommended if your DMs are ever screenshotted.", False)
-        add_field(embed, "ℹ️ Note",
-                  "The link is personal — anyone who has it can open a root shell. "
-                  "Ask for a new one any time.", False)
-        audit("webssh_token", interaction.user.id, target=vps["container_name"])
-        await interaction.followup.send(embed=embed, ephemeral=True,
-                                        view=WebSSHLinkView(interaction.user.id, token,
-                                                            vps["container_name"]))
+        node = await run_blocking(get_node, vps["node_id"])
+        ssh_host = ((node.get("url") or "").replace("http://", "").replace("https://", "").split(":")[0]
+                    if node else "") or YOUR_SERVER_IP
+        link = await asyncio.to_thread(
+            start_sshx_session, ssh_host, int(forward["host_port"]), str(password), int(vps["id"])
+        )
+        if not link:
+            await interaction.followup.send(
+                embed=error_embed("SSHX Could Not Start", "SSHX could not create a session. Check VPS SSH access and network connectivity."),
+                ephemeral=True,
+            )
+            return
+
+        embed = create_embed("SSHX Terminal Ready", f"Private browser terminal for `{vps['container_name']}`.", COLORS["network"])
+        add_field(embed, "🌐 Your SSHX Link", f"[**→ Open VPS Terminal**]({link})", False)
+        add_field(embed, "🔐 Privacy", "This link is sent only to the VPS owner in this private interaction. Anyone you share it with may access the terminal.", False)
+        audit("sshx_link", interaction.user.id, target=vps["container_name"])
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── ports ────────────────────────────────────────────────────────────────
     async def _ports(self, interaction: discord.Interaction) -> None:
