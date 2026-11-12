@@ -4415,6 +4415,135 @@ def start_sshx_session(host: str, port: int, password: str, vps_id: int) -> Opti
     return None
 
 
+# ── SSHX via `lxc exec` (no SSH password / port-forward / NAT-hairpin needed) ──
+_SSHX_LINK_RE = re.compile(r"https://sshx\.io/s/[A-Za-z0-9._~%+/-]+(?:#[A-Za-z0-9._~%+/-]+)?")
+
+# POSIX sh only (Alpine/busybox safe). Never echoes the link to anything but stdout.
+_SSHX_GUEST_SCRIPT = r"""
+export PATH="/root/.local/bin:/root/.cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
+LOG=/tmp/.sshx_session.log
+
+fetch() {  # fetch <url> -> stdout
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 15 --max-time 120 "$1"
+  else wget -qO- -T 15 "$1"; fi
+}
+
+# 1) make sure we can download things
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  echo "SSHX_STAGE: installing curl"
+  if   command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y curl ca-certificates >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl ca-certificates >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y curl ca-certificates >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm curl ca-certificates >/dev/null 2>&1
+  elif command -v zypper >/dev/null 2>&1; then zypper -n install curl ca-certificates >/dev/null 2>&1
+  fi
+fi
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  echo "SSHX_ERROR: curl/wget missing and could not be installed (container has no working internet or package manager)"
+  exit 10
+fi
+
+# 2) network sanity check (gives a precise reason instead of a generic failure)
+if ! fetch https://sshx.io/get >/dev/null 2>&1; then
+  if ! getent hosts sshx.io >/dev/null 2>&1 && ! nslookup sshx.io >/dev/null 2>&1; then
+    echo "SSHX_ERROR: DNS lookup for sshx.io failed inside the VPS (check /etc/resolv.conf / container DNS)"
+  else
+    echo "SSHX_ERROR: VPS cannot reach https://sshx.io (outbound HTTPS blocked or no internet)"
+  fi
+  exit 11
+fi
+
+# 3) install the sshx binary if needed
+SSHX_BIN="$(command -v sshx 2>/dev/null)"
+if [ -z "$SSHX_BIN" ]; then
+  echo "SSHX_STAGE: installing sshx"
+  fetch https://sshx.io/get | sh >/dev/null 2>&1
+  SSHX_BIN="$(command -v sshx 2>/dev/null)"
+fi
+if [ -z "$SSHX_BIN" ]; then
+  # direct download fallback (official release tarball)
+  case "$(uname -m)" in
+    x86_64|amd64)  A=x86_64 ;;
+    aarch64|arm64) A=aarch64 ;;
+    armv7l|armv6l) A=arm ;;
+    *) A="" ;;
+  esac
+  if [ -n "$A" ]; then
+    echo "SSHX_STAGE: direct download"
+    fetch "https://s3.amazonaws.com/sshx/sshx-$A-unknown-linux-musl.tar.gz" 2>/dev/null | tar -xz -C /usr/local/bin sshx 2>/dev/null
+    chmod +x /usr/local/bin/sshx 2>/dev/null
+    SSHX_BIN="$(command -v sshx 2>/dev/null)"
+  fi
+fi
+if [ -z "$SSHX_BIN" ]; then
+  echo "SSHX_ERROR: sshx binary could not be installed (tar/gzip missing, unsupported CPU or download blocked)"
+  exit 12
+fi
+
+# 4) stop any old session, start a fresh one fully detached from this exec pipe
+pkill -x sshx >/dev/null 2>&1
+sleep 1
+rm -f "$LOG"
+: > "$LOG"; chmod 600 "$LOG"
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup "$SSHX_BIN" >"$LOG" 2>&1 </dev/null &
+else
+  nohup "$SSHX_BIN" >"$LOG" 2>&1 </dev/null &
+fi
+
+# 5) wait for the link (up to ~45s)
+i=0
+while [ $i -lt 45 ]; do
+  L="$(sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" 2>/dev/null | grep -o 'https://sshx\.io/s/[^[:space:]]*' | head -n 1)"
+  if [ -n "$L" ]; then
+    echo "SSHX_LINK: $L"
+    rm -f "$LOG"   # the running process keeps its fd; the link no longer sits on disk
+    exit 0
+  fi
+  if ! pgrep -x sshx >/dev/null 2>&1; then
+    break
+  fi
+  i=$((i+1)); sleep 1
+done
+echo "SSHX_ERROR: sshx started but returned no link. Client output:"
+sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" 2>/dev/null | tail -n 8
+rm -f "$LOG"
+exit 13
+"""
+
+
+async def start_sshx_in_container(container_name: str, node_id: Optional[int],
+                                  vps_id: int) -> Tuple[Optional[str], str]:
+    """Start SSHX *inside* the container through `lxc exec`.
+
+    Returns (link, reason). `reason` is a short, secret-free explanation for the
+    user/console when link is None.
+    """
+    try:
+        out = await container_shell(container_name, _SSHX_GUEST_SCRIPT, timeout=200,
+                                    node_id=node_id, stdin="")
+    except Exception as exc:
+        reason = f"lxc exec failed: {scrub_secrets(exc)[:200]}"
+        logger.error("SSHX VPS #%s (lxc exec path) failed: %s", vps_id, reason)
+        return None, reason
+
+    clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", out or "")
+    match = _SSHX_LINK_RE.search(clean)
+    if match:
+        logger.info("SSHX session created for VPS #%s (lxc exec)", vps_id)
+        return match.group(0).rstrip(".,);]\"'"), ""
+
+    safe = _SSHX_LINK_RE.sub("[SSHX_LINK_REDACTED]", scrub_secrets(clean))
+    errs = [ln.strip() for ln in safe.splitlines() if ln.strip().startswith("SSHX_ERROR")]
+    reason = (errs[-1] if errs else safe.strip()[-300:] or "no output from container")[:300]
+    logger.error("SSHX VPS #%s (lxc exec path) failed. Output: %s", vps_id, safe[-1500:] or "<no output>")
+    return None, reason
+
+
 def webssh_url_for(host_port: Optional[int]) -> Optional[str]:
     if not host_port:
         return None
@@ -7817,45 +7946,42 @@ class ManageView(PanelView):
             return
 
         await safe_defer(interaction, ephemeral=True)
-        forward = next((f for f in await run_blocking(get_forwards_for_container, vps["container_name"])
-                        if int(f["vps_port"]) == 22), None)
-        if forward is None:
-            host_port = await create_port_forward(vps["user_id"], vps["container_name"], 22, vps["node_id"])
-            if not host_port:
-                await interaction.followup.send(
-                    embed=error_embed("SSH Port Setup Failed", "Could not create the VPS SSH port forward."),
-                    ephemeral=True,
-                )
-                return
-            forward = {"host_port": host_port, "vps_port": 22}
 
-        password = decrypt_secret(vps.get("root_password"))
-        if not password:
-            await interaction.followup.send(
-                embed=error_embed("Password Unavailable", "Regenerate the VPS root password, then try again."),
-                ephemeral=True,
-            )
-            return
+        # Primary path: run SSHX inside the container via `lxc exec` (works for local
+        # and remote nodes; needs no SSH password, port forward or NAT hairpin).
+        link, reason = await start_sshx_in_container(
+            vps["container_name"], vps.get("node_id"), int(vps["id"]))
 
-        node = await run_blocking(get_node, vps["node_id"])
-        node_url = str((node or {}).get("url") or "").strip()
-        if node_url:
-            parsed_node_url = urlparse(node_url if "://" in node_url else "//" + node_url)
-            ssh_host = parsed_node_url.hostname or node_url.split("/")[0].split(":")[0]
-        else:
-            ssh_host = YOUR_SERVER_IP
-        if not ssh_host:
-            await interaction.followup.send(
-                embed=error_embed("Node Address Missing", "Set the node URL or YOUR_SERVER_IP to the reachable node address."),
-                ephemeral=True,
-            )
-            return
-        link = await asyncio.to_thread(
-            start_sshx_session, ssh_host, int(forward["host_port"]), str(password), int(vps["id"])
-        )
+        # Fallback path: legacy SSH login through the forwarded port.
+        if not link:
+            try:
+                forward = next((f for f in await run_blocking(get_forwards_for_container, vps["container_name"])
+                                if int(f["vps_port"]) == 22), None)
+                if forward is None:
+                    host_port = await create_port_forward(vps["user_id"], vps["container_name"], 22, vps["node_id"])
+                    if host_port:
+                        forward = {"host_port": host_port, "vps_port": 22}
+                password = decrypt_secret(vps.get("root_password"))
+                node = await run_blocking(get_node, vps["node_id"])
+                node_url = str((node or {}).get("url") or "").strip()
+                if node_url:
+                    parsed_node_url = urlparse(node_url if "://" in node_url else "//" + node_url)
+                    ssh_host = parsed_node_url.hostname or node_url.split("/")[0].split(":")[0]
+                else:
+                    ssh_host = YOUR_SERVER_IP
+                if forward and password and ssh_host:
+                    link = await asyncio.to_thread(
+                        start_sshx_session, ssh_host, int(forward["host_port"]), str(password), int(vps["id"]))
+            except Exception as exc:
+                logger.error("SSHX VPS #%s SSH fallback failed: %s", vps.get("id"), scrub_secrets(exc))
+
         if not link:
             await interaction.followup.send(
-                embed=error_embed("SSHX Could Not Start", "The bot could not finish the SSHX startup. Check the bot console for the exact SSHX stage/error (SSH connection, installer, or network). The private session link is never written to logs."),
+                embed=error_embed(
+                    "SSHX Could Not Start",
+                    f"**Reason:** `{(reason or 'unknown')[:300]}`\n\n"
+                    "Most common fixes: make sure the VPS has internet/DNS, then press SSHX again. "
+                    "Full details are in the bot console. The private session link is never written to logs."),
                 ephemeral=True,
             )
             return
@@ -9067,11 +9193,15 @@ async def provision_vps(*, responder: Responder, owner: discord.abc.User, node_i
                 if node else "") or YOUR_SERVER_IP
     ssh_command = ssh_command_for(ssh_port, host=ssh_host)
     sshx_link = None
-    if ssh_port and password:
-        # Start the shared terminal inside this VPS, not on the bot's WebSSH gateway.
-        sshx_link = await asyncio.to_thread(
-            start_sshx_session, ssh_host, int(ssh_port), str(password), int(vps_id)
-        )
+    try:
+        # Start the shared terminal inside this VPS (lxc exec first, SSH as fallback).
+        sshx_link, _sshx_reason = await start_sshx_in_container(container, node_id, int(vps_id))
+        if not sshx_link and ssh_port and password:
+            sshx_link = await asyncio.to_thread(
+                start_sshx_session, ssh_host, int(ssh_port), str(password), int(vps_id)
+            )
+    except Exception as exc:
+        logger.error("SSHX auto-start for VPS #%s failed: %s", vps_id, scrub_secrets(exc))
 
     success = success_embed(
         "✅ VPS Successfully Deployed!",
@@ -9112,7 +9242,7 @@ async def provision_vps(*, responder: Responder, owner: discord.abc.User, node_i
     if sshx_link:
         add_field(
             dm, "🌐 Browser Terminal (SSHX)",
-            f"[**→ Open VPS Terminal**]({sshx_link})\\n"
+            f"[**→ Open VPS Terminal**]({sshx_link})\n"
             "🔐 This is a private, full-access terminal link. Do not share it publicly.",
             False,
         )
